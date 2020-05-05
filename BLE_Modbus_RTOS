@@ -1,0 +1,671 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <ModbusMaster.h>
+#include <stdlib.h>
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+
+//+------------------------------------------constants ------------------------------------------------+
+// BLE & WIFI Related
+#define serviceID BLEUUID((uint16_t)0x181C)
+
+String value = "";
+String ssid = "";
+String password = "";
+String mqtt_uri = "";
+String mqtt_port = "";
+
+BLEDevice *myBleDevice;
+BLEServer *myBleServer;
+BLEService * customService;
+
+bool BLE_IS_ON = true;
+bool Power_N_Heat_IS_ON = false ;
+
+//const char* ssid = "Birkelund";
+//const char* paessword = "NuVaRing67890";
+//const char* mqtt_servr = "78.156.102.68";
+long lastMsg = 0;
+char msg[50];
+//int value = 0;
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+#define RS485_DE 14     //enable send pin of Olimex ESP32 EVB
+#define RS485_RE_NEG 17 //enable receive pin of Olimex ESP32 EVB
+
+#define RXD1 36 //UART Receive pin of Olimex ESP32 EVB
+#define TXD1 4  //UART Send pin of Olimex ESP32 EVB
+
+// instantiate ModbusMaster object
+ModbusMaster node_abb;
+ModbusMaster node_heat;
+//+-----------------------------------------------------------------------------------------------------+
+
+//+------------------------------------------helper Functions & Structures ------------------------------------------------+
+
+//-------------------------- data sturcture/union
+union {
+  uint32_t i;
+  float f;
+} data;
+
+//-------------------------- before Transmission
+void preTransmission()
+{
+  digitalWrite(RS485_DE, HIGH);
+  digitalWrite(RS485_RE_NEG, HIGH);
+}
+
+//-------------------------- after Transmission
+void postTransmission()
+{
+  digitalWrite(RS485_RE_NEG, LOW);
+  digitalWrite(RS485_DE, LOW);
+}
+
+//-------------------------- Handle Modbus MSG & errors
+bool getResultMsg(ModbusMaster *node_abb, uint8_t result)
+{
+  String tmpstr2 = "\r\n";
+  switch (result)
+  {
+  case node_abb->ku8MBSuccess:
+    return true;
+    break;
+  case node_abb->ku8MBIllegalFunction:
+    tmpstr2 += "Illegal Function";
+    break;
+  case node_abb->ku8MBIllegalDataAddress:
+    tmpstr2 += "Illegal Data Address";
+    break;
+  case node_abb->ku8MBIllegalDataValue:
+    tmpstr2 += "Illegal Data Value";
+    break;
+  case node_abb->ku8MBSlaveDeviceFailure:
+    tmpstr2 += "Slave Device Failure";
+    break;
+  case node_abb->ku8MBInvalidSlaveID:
+    tmpstr2 += "Invalid Slave ID";
+    break;
+  case node_abb->ku8MBInvalidFunction:
+    tmpstr2 += "Invalid Function";
+    break;
+  case node_abb->ku8MBResponseTimedOut:
+    tmpstr2 += "Response Timed Out";
+    break;
+  case node_abb->ku8MBInvalidCRC:
+    tmpstr2 += "Invalid CRC";
+    break;
+  default:
+    tmpstr2 += "Unknown error: " + String(result);
+    break;
+  }
+  Serial.println(tmpstr2);
+  return false;
+}
+
+//-------------------------- Select Power Meter
+void select_abb()
+{
+  node_abb.begin(0x01, Serial1);
+  // Callbacks allow us to configure the RS485 transceiver correctly
+  node_abb.preTransmission(preTransmission);
+  node_abb.postTransmission(postTransmission);
+}
+//-------------------------- Select Heat Meter
+void select_heat()
+{
+  node_heat.begin(0x02, Serial1);
+  // Callbacks allow us to configure the RS485 transceiver correctly
+  node_heat.preTransmission(preTransmission);
+  node_heat.postTransmission(postTransmission);
+}
+
+//-------------------------- Decimal to HEX
+String decToHex(int decValue, int desiredStringLength)
+{
+
+  String hexString = String(decValue, HEX);
+  while (hexString.length() < desiredStringLength)
+    hexString = "0" + hexString;
+
+  return hexString;
+}
+
+//+------------------------------------------helper Functions & Structures ------------------------------------------------+
+
+//+-------------------------------------------BLE Characteristics--------------------------------------------------------+
+// Initi WIFI Connection from BT
+BLECharacteristic init_conCharacteristic(
+    BLEUUID((uint16_t)0x2A3D),
+    BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_WRITE
+
+);
+
+// WIFI state Notification for BT
+BLECharacteristic wifi_stateCharacteristic(
+    BLEUUID((uint16_t)0x2A3D),
+    BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_NOTIFY
+
+);
+
+// MQTT state Notificateion for BT
+BLECharacteristic mqtt_stateCharacteristic(
+    BLEUUID((uint16_t)0x2A3D),
+    BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_NOTIFY
+
+);
+
+// Set the SSID of the WIFI
+BLECharacteristic ssidCharacteristic(
+    BLEUUID((uint16_t)0x2A3D),
+    BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_WRITE);
+
+// Set the PASS of the WIFI
+BLECharacteristic passCharacteristic(
+    BLEUUID((uint16_t)0x2A3D),
+    BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_WRITE);
+
+// Set the MQTT URI
+BLECharacteristic mqtt_uriCharacteristic(
+    BLEUUID((uint16_t)0x2AB6),
+    BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_WRITE);
+
+// Set the MQTT PORT
+BLECharacteristic mqtt_portCharacteristic(
+    BLEUUID((uint16_t)0x2A3D),
+    BLECharacteristic::PROPERTY_READ |
+        BLECharacteristic::PROPERTY_WRITE);
+
+//+-------------------------------------------BLE Characteristics--------------------------------------------------------+
+
+
+//+-----------------------------------------FreeRTOS Tasks-------------------------------------------------------------------+
+
+
+
+//+----------------------------------------------------FreeRTOS Tasks-----------------------------------------------------+
+
+//+---------------- PowerMeter Task
+void Task_ABB_Read_Publish(void *arrow)
+{
+  for (;;)
+  {
+    char tempString[8];  //v1
+    char tempString1[8]; //v2
+    char tempString2[8]; //v3
+    char tempString3[8]; //active net
+    char tempString4[8]; //active consume
+
+    uint8_t vol_1, vol_2, vol_3, active_power, active_net;
+    Serial.println("------ ABB Power Meter Values --------");
+
+    select_abb(); //select the ABB power meter
+
+    vol_1 = node_abb.readHoldingRegisters(0x5B00, 2);
+    if (getResultMsg(&node_abb, vol_1))
+    {
+      double res_dbl = (node_abb.getResponseBuffer(0) * 65535 + node_abb.getResponseBuffer(1)) / 10.0;
+      String res = "Voltage L1-N: " + String(res_dbl) + " V";
+      Serial.println(res);
+      dtostrf(res_dbl, 1, 2, tempString);
+
+      client.publish("mb/voltage1", tempString);
+    }
+    //-----------------------------------------------------------------
+
+    vol_2 = node_abb.readHoldingRegisters(0x5B02, 2);
+    if (getResultMsg(&node_abb, vol_2))
+    {
+      double res_dbl = (node_abb.getResponseBuffer(0) * 65535 + node_abb.getResponseBuffer(1)) / 10.0;
+      String res = "Voltage L2-N: " + String(res_dbl) + " V";
+      Serial.println(res);
+      dtostrf(res_dbl, 1, 2, tempString1);
+
+      client.publish("mb/voltage2", tempString1);
+    }
+    //-----------------------------------------------------------------
+
+    vol_3 = node_abb.readHoldingRegisters(0x5B04, 2);
+    if (getResultMsg(&node_abb, vol_3))
+    {
+      double res_dbl = (node_abb.getResponseBuffer(0) * 65535 + node_abb.getResponseBuffer(1)) / 10.0;
+      String res = "Voltage L3-N: " + String(res_dbl) + " V";
+      Serial.println(res);
+      dtostrf(res_dbl, 1, 2, tempString2);
+
+      client.publish("mb/voltage3", tempString2);
+    }
+    //-----------------------------------------------------------------
+
+    active_net = node_abb.readHoldingRegisters(0x5B14, 2);
+    if (getResultMsg(&node_abb, active_net))
+    {
+      double res_dbl = (node_abb.getResponseBuffer(0) * 65535 + node_abb.getResponseBuffer(1)) / 100.0;
+      String res = "Active net: " + String(res_dbl) + " W";
+      Serial.println(res);
+      dtostrf(res_dbl, 1, 2, tempString3);
+
+      client.publish("mb/power", tempString3);
+    }
+    //-----------------------------------------------------------------
+
+    active_power = node_abb.readHoldingRegisters(0x5000, 4);
+    if (getResultMsg(&node_abb, active_power))
+    {
+      String hex_array;
+      for (int i = 0; i < 4; i++)
+      {
+        hex_array += decToHex(node_abb.getResponseBuffer(i), 4) + " ";
+      }
+      // Serial.println("Active net hex array: " + hex_array);
+      double res_dbl = (node_abb.getResponseBuffer(2) * 65535 + node_abb.getResponseBuffer(3)) / 100.0;
+      String res = "Active Energy Consumption: " + String(res_dbl) + " kWh";
+      Serial.println(res);
+      dtostrf(res_dbl, 1, 2, tempString4);
+
+      client.publish("mb/energy", tempString4);
+    }
+    //-----------------------------------------------------------------
+
+    Serial.println("---------------------------------------------------------");
+
+    // This is 1 min + 5 sec , This can be adjusted like in regular Arduino
+    delay(65000);
+  }
+}
+
+//+---------------- HeatMeter Task
+void Task_HeatMeter_Read_Publish(void *arrow)
+{
+  for (;;)
+  {
+    char tempString[8];  //t1
+    char tempString1[8]; //t2
+    char tempString2[8]; //positive cumulative
+    uint8_t temp_1, temp_2, positive_cumulative_heat;
+
+    Serial.println("------- Heat Meter Values ----------");
+
+    select_heat(); //selet the heat meter
+
+    temp_1 = node_heat.readHoldingRegisters(0x0021, 2);
+    if (getResultMsg(&node_heat, temp_1))
+    {
+      char HEXString[9];
+      String str = decToHex(node_heat.getResponseBuffer(0), 4) +
+                   decToHex(node_heat.getResponseBuffer(1), 4);
+      str.toCharArray(HEXString, 9);
+
+      data.i = strtoul(HEXString, NULL, 16);
+      String res = "Temperature 1: " + String(data.f) + " ℃";
+      //String m=string(data.f);
+      Serial.println(res);
+      dtostrf(data.f, 1, 2, tempString);
+
+      client.publish("mb/t1", tempString);
+    }
+    //-----------------------------------------------------------------
+
+    temp_2 = node_heat.readHoldingRegisters(0x0023, 2);
+    if (getResultMsg(&node_heat, temp_2))
+    {
+      char HEXString[9];
+      String str = decToHex(node_heat.getResponseBuffer(0), 4) +
+                   decToHex(node_heat.getResponseBuffer(1), 4);
+
+      str.toCharArray(HEXString, 9);
+      data.i = strtoul(HEXString, NULL, 16);
+
+      String res = "Temperature 2: " + String(data.f) + " ℃";
+      Serial.println(res);
+
+      dtostrf(data.f, 1, 2, tempString1);
+
+      client.publish("mb/t2", tempString1);
+    }
+    //-----------------------------------------------------------------
+
+    positive_cumulative_heat = node_heat.readHoldingRegisters(0x0011, 2);
+    if (getResultMsg(&node_heat, positive_cumulative_heat))
+
+    {
+      long pos = node_heat.getResponseBuffer(0) * 65536 + node_heat.getResponseBuffer(1);
+      String res = "Positive Cumulative Heat rate: " + String(pos);
+      Serial.println(res);
+
+      dtostrf(pos, 1, 2, tempString2);
+
+      client.publish("mb/heat", tempString2);
+    }
+    //-----------------------------------------------------------------
+
+    Serial.println("---------------------------------------------------------");
+    // This is 1 min + 10 sec , This can be adjusted like in regular Arduino
+    delay(70000);
+  }
+}
+
+//+----------------------------------------------------FreeRTOS Tasks-----------------------------------------------------+
+
+//+------------------------------------------MQTT Related ------------------------------------------------------------------+
+
+//----------------------Reconnect Scheme
+void reconnect()
+{
+  // Loop until we're reconnected
+  while (!client.connected())
+  {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (client.connect("ESP32Client_IDLE"))
+    {
+      Serial.println("connected");
+      // Subscribe
+      client.subscribe("esp32/output");
+
+      if(Power_N_Heat_IS_ON == false)
+      {
+         Power_N_Heat_IS_ON = true ;
+         mqtt_stateCharacteristic.setValue("MQTT Connected !");
+         mqtt_stateCharacteristic.notify();
+         //delay(2000); 
+
+         Serial.println("Closing Down BlE Services !");
+         //myBleServer->removeService(customService);
+         //myBleServer->disconnect(0);
+         myBleDevice->deinit();
+
+         Serial.println("Starting Power & heat Meter Tasks ...");
+         xTaskCreate(Task_ABB_Read_Publish, "PowerMeter_Handler", 4096 * 2, NULL, 2, NULL);
+         xTaskCreate(Task_HeatMeter_Read_Publish, "HeatMeter_Handler", 4096 * 2, NULL, 2, NULL);
+
+      }
+    }
+    else
+    {
+      Serial.print("failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+//----------------------Callback Scheme
+void callback(char *topic, byte *message, unsigned int length)
+{
+  Serial.print("Message arrived on topic: ");
+  Serial.print(topic);
+  Serial.print(". Message: ");
+  String messageTemp;
+
+  for (int i = 0; i < length; i++)
+  {
+    Serial.print((char)message[i]);
+    messageTemp += (char)message[i];
+  }
+  Serial.println();
+  /*
+  // Feel free to add more if statements to control more GPIOs with MQTT
+  // If a message is received on the topic esp32/output, you check if the message is either "on" or "off". 
+  // Changes the output state according to the message
+  */
+  if (String(topic) == "esp32/output")
+  {
+    Serial.print("Changing output to ");
+    if (messageTemp == "on")
+    {
+      Serial.println("on");
+    }
+    else if (messageTemp == "off")
+    {
+      Serial.println("off");
+    }
+  }
+}
+
+//+------------Task Run MQTT---------------+
+void Task_Run_MQTT(void *arrow)
+{
+  for (;;)
+  {
+    if (!client.connected())
+    {
+      reconnect();
+    }
+    client.loop();
+  }
+}
+
+//+------------------------------------------MQTT Related ------------------------------------------------------------------+
+
+
+
+//+------------------------------------------Wifi Setup------------------------------------------------------------------+
+void setup_wifi()
+{
+  delay(10);
+  // We start by connecting to a WiFi network
+  Serial.println();
+  Serial.print("Connecting to ");
+  Serial.println(ssid.c_str());
+
+  WiFi.begin(ssid.c_str(), password.c_str());
+
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.println("IP address: ");
+  Serial.println(WiFi.localIP());
+
+  if (BLE_IS_ON)
+  {
+    wifi_stateCharacteristic.setValue("Wifi Connected !");
+    wifi_stateCharacteristic.notify();
+  }
+
+  Serial.println("Apply Settings for Power & Heat Meters ...  ");
+  pinMode(RS485_RE_NEG, OUTPUT);
+  pinMode(RS485_DE, OUTPUT);
+  // Init in receive mode
+  digitalWrite(RS485_RE_NEG, LOW);
+  digitalWrite(RS485_DE, LOW);
+
+  // Modbus communication runs at 9600 baud
+  Serial1.begin(9600, SERIAL_8N1, RXD1, TXD1, true);
+
+  Serial.println("Starting MQTT ...");
+  client.setServer(mqtt_uri.c_str(), mqtt_port.toInt());
+  client.setCallback(callback);
+   // Run MQTT
+  xTaskCreate(Task_Run_MQTT, "MQTT_Client_Handler", 4096 * 2, NULL, 2, NULL);
+}
+
+//+------------------------------------------Wifi Setup------------------------------------------------------------------+
+
+
+//+----------------------------------------BLE Functions/Classes--------------------------------------------------//
+
+// Only Indicate Connect/Disconnect
+class ServerCallbacks : public BLEServerCallbacks
+{
+  void onConnect(BLEServer *myBleServer)
+  {
+    Serial.println("Client Connected to BLE Server");
+  };
+
+  void onDisconnect(BLEServer *myBleServer)
+  {
+    Serial.println("No Connection !");
+  }
+};
+
+// Global Callback for the Charactristics
+class CharactristicsCallBack : public BLECharacteristicCallbacks
+{
+
+public:
+  String pchar;
+  int Rank;
+
+  // make a constructor just for the sake of having 1 callback instead of 4 !
+  CharactristicsCallBack(int rank)
+  {
+    Rank = rank;
+  }
+
+  void onWrite(BLECharacteristic *customCharacteristic)
+  {
+    std::string rcvString = customCharacteristic->getValue();
+
+    if (rcvString.length() > 0)
+    {
+      Serial.print("Value Received from BLE: ");
+      value = rcvString.c_str();
+      Serial.println(value); // only for organized output
+
+      customCharacteristic->setValue((char *)&value);
+
+      switch (Rank)
+      {
+      case 1:
+        Serial.print("WIFI PaSS was Changed to : ");
+        Serial.println(value);
+        password = value;
+        break;
+
+      case 2:
+        Serial.print("WIFI SSID was Changed to : ");
+        Serial.println(value);
+        ssid = value;
+        break;
+
+      case 3:
+        Serial.print("MQTT URI was Changed to : ");
+        Serial.println(value);
+        mqtt_uri = value;
+        break;
+
+      case 4:
+        Serial.print("MQTT Port was Changed to : ");
+        Serial.println(value);
+        Serial.println(value.toInt());
+        mqtt_port = value ;
+        break;
+
+      case 5:
+        if (value == "on")
+          setup_wifi();
+
+      default:
+        break;
+      }
+
+      value = ""; // set value to null again to avoid remaining chars from previous entry
+      // }
+    }
+    else
+    {
+      Serial.println("Empty Value Received!");
+    }
+  }
+};
+
+// Global Function for BLE Server
+void Task_Start_BLE()
+{
+  // for(;;)
+  // {
+  //BLEDevice::init("Cyfer_ESP32_Server");
+  myBleDevice->init("Power&Heat Meter Server");
+
+  // Create the BLE Server
+  //BLEServer *MyServer = BLEDevice::createServer();
+  myBleServer = myBleDevice->createServer();
+
+  myBleServer->setCallbacks(new ServerCallbacks());
+
+  // Create the BLE Service
+  customService = myBleServer->createService(serviceID, 27);
+  //  BLEService *infoService = MyServer->createService(InfoServiceID);
+  //BLEService *customService = MyServer->createService(myServiceID);
+
+  // Create a BLE Characteristics
+  customService->addCharacteristic(&ssidCharacteristic);
+  customService->addCharacteristic(&passCharacteristic);
+  customService->addCharacteristic(&mqtt_uriCharacteristic);
+  customService->addCharacteristic(&mqtt_portCharacteristic);
+  customService->addCharacteristic(&init_conCharacteristic);
+  customService->addCharacteristic(&wifi_stateCharacteristic);
+  customService->addCharacteristic(&mqtt_stateCharacteristic);
+
+  // Set Initial Values for the characteristics
+  ssidCharacteristic.setValue("Enter WIFI Network SSID");
+  passCharacteristic.setValue("Enter WIFI Network PASS");
+  mqtt_uriCharacteristic.setValue("Enter MQTT URI");
+  mqtt_portCharacteristic.setValue("Enter MQTT PORT");
+  init_conCharacteristic.setValue("off, change to on to start connection");
+  wifi_stateCharacteristic.setValue("Wifi Not Connected !");
+  mqtt_stateCharacteristic.setValue("Mqtt Not Connected !");
+
+  // Make the Calll back with a specific number !
+  // Instead of 5 callback classes --> 1 Global Class , YaaaaY !!!!
+  passCharacteristic.setCallbacks(new CharactristicsCallBack(1));
+  ssidCharacteristic.setCallbacks(new CharactristicsCallBack(2));
+  mqtt_uriCharacteristic.setCallbacks(new CharactristicsCallBack(3));
+  mqtt_portCharacteristic.setCallbacks(new CharactristicsCallBack(4));
+  init_conCharacteristic.setCallbacks(new CharactristicsCallBack(5));
+
+  // https://www.bluetooth.com/specifications/gatt/viewer?attributeXmlFile=org.bluetooth.descriptor.gatt.client_characteristic_configuration.xml
+  // Create a BLE Descriptor
+  ssidCharacteristic.addDescriptor(new BLE2902());
+  passCharacteristic.addDescriptor(new BLE2902());
+  mqtt_uriCharacteristic.addDescriptor(new BLE2902());
+  mqtt_portCharacteristic.addDescriptor(new BLE2902());
+  init_conCharacteristic.addDescriptor(new BLE2902());
+
+  wifi_stateCharacteristic.addDescriptor(new BLE2902());
+  mqtt_stateCharacteristic.addDescriptor(new BLE2902());
+
+  //BLEDescriptor *ssidDecriptor = new BLE2902();
+
+  myBleServer->getAdvertising()->addServiceUUID(serviceID);
+  // MyServer->getAdvertising()->addServiceUUID(InfoServiceID);
+
+  // Start the service
+  customService->start();
+
+  // Start advertising
+  myBleServer->getAdvertising()->start();
+  // }
+}
+//+----------------------------------------BLE Functions--------------------------------------------------//
+
+void setup()
+{
+  Serial.begin(115200);
+  Task_Start_BLE();
+}
+
+void loop()
+{
+  // Always Nothing if we use FreeRTOS Tasks
+}
